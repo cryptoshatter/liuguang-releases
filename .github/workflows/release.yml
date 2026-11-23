@@ -1,0 +1,90 @@
+name: 打包发布
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.c.outputs.build }}
+      sha: ${{ steps.c.outputs.sha }}
+    steps:
+      - id: c
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(git ls-remote "https://x-access-token:${SOURCE_TOKEN}@github.com/cryptoshatter/liuguang.git" refs/heads/main | cut -f1)
+          if [ -z "$SHA" ]; then echo "读不到源码仓库，检查 SOURCE_TOKEN"; exit 1; fi
+          LAST=$(gh release view -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null | grep -o '源码 [0-9a-f]*' | cut -d' ' -f2 || true)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if [ "$SHA" = "$LAST" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: cryptoshatter/liuguang
+          ref: ${{ needs.check.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - run: npm ci
+        working-directory: app
+
+      - name: 设置版本号
+        working-directory: app
+        run: |
+          V="0.3.${{ github.run_number }}"
+          node -e 'const f="src-tauri/tauri.conf.json";const c=require("./"+f);c.version=process.argv[1];require("fs").writeFileSync(f,JSON.stringify(c,null,2)+"\n")' "$V"
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: app
+          tagName: v${{ env.APP_VERSION }}
+          releaseName: 流光 ${{ env.APP_VERSION }}
+          releaseBody: |
+            在流光里点「更新」即可；手动安装就把 dmg 里的流光拖进「应用程序」覆盖旧版，数据不受影响。
+
+            源码 ${{ needs.check.outputs.sha }}
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: --target universal-apple-darwin
